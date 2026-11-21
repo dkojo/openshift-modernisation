@@ -13,7 +13,7 @@ COPY ${WAR_FILE} /app.war
 RUN mkdir /app && unzip -q /app.war -d /app
 
 # Stage 2: the runtime image
-FROM tomcat:10.1.62-jre21-temurin-noble
+FROM tomcat:10.1.16-jre21-temurin-jammy
 ARG APP_NAME=inventory
 
 RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/* \
