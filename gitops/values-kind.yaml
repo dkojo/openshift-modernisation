@@ -1,6 +1,6 @@
 # The desired state for the kind cluster. CI updates image.tag after every push to main;
 # Argo CD notices the commit and rolls it out. Git is the only way to deploy.
 image:
-  tag: "latest"
+  tag: "89e1c9e"
 # Simulate OpenShift: run as a random high UID the image has never heard of
 runAsUser: 1000680000
