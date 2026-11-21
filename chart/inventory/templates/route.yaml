@@ -1,0 +1,14 @@
+{{- if .Values.route.enabled }}
+# OpenShift only: exposes the service over HTTPS through the cluster's router
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: {{ .Release.Name }}
+spec:
+  {{- with .Values.route.host }}
+  host: {{ . }}
+  {{- end }}
+  to: { kind: Service, name: {{ .Release.Name }} }
+  port: { targetPort: http }
+  tls: { termination: edge, insecureEdgeTerminationPolicy: Redirect }
+{{- end }}

@@ -1,0 +1,140 @@
+name: modernise
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: [gitops/values-kind.yaml]   # the tag bump below is a deploy, not a new build
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write    # commit the new image tag to Git (GitOps)
+  packages: write    # push the image to GitHub Container Registry
+
+concurrency:
+  group: modernise-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/dkojo/openshift-modernisation/inventory
+
+jobs:
+  modernise:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Java
+        uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Build WAR and unit tests
+        run: mvn -B -q -f app/pom.xml verify && ls -lh app/target/inventory.war
+
+      # The same reusable Dockerfile works for any legacy .war
+      - name: Build image (reusable Dockerfile)
+        run: |
+          echo "TAG=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          docker build -f docker/tomcat-war.Dockerfile --build-arg WAR_FILE=app/target/inventory.war -t "$IMAGE:${GITHUB_SHA::7}" .
+          docker image ls "$IMAGE" --format 'Image size: {{.Size}}'
+
+      - name: Image scan (Trivy)
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.76.2 image \
+            --exit-code 1 --severity CRITICAL,HIGH --ignore-unfixed --no-progress --scanners vuln "$IMAGE:$TAG"
+
+      - name: Helm lint
+        run: |
+          helm lint chart/inventory -f gitops/values-kind.yaml
+          helm template inventory chart/inventory -f gitops/values-kind.yaml > /dev/null
+
+      # ---------- main only: store, deploy through Git, verify ----------
+
+      - name: Sign in to GHCR
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        run: echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push image to registry
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        run: docker push "$IMAGE:$TAG"
+
+      - name: GitOps commit new image tag
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        run: |
+          sed -i "s/^  tag: .*/  tag: \"$TAG\"/" gitops/values-kind.yaml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "Deploy inventory $TAG"
+          git push
+          echo "DEPLOY_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      # A fresh cluster that enforces OpenShift's defaults: the "restricted" pod security level
+      - name: Create cluster with OpenShift rules
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
+        with:
+          cluster_name: modernise
+
+      - name: Install Argo CD
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        run: |
+          kubectl create namespace legacy
+          kubectl label namespace legacy pod-security.kubernetes.io/enforce=restricted pod-security.kubernetes.io/warn=restricted
+          kubectl create namespace argocd
+          kubectl apply -n argocd --server-side -f https://raw.githubusercontent.com/argoproj/argo-cd/v3.6.2/manifests/install.yaml >/dev/null
+          kubectl -n argocd rollout status deploy/argocd-repo-server --timeout=180s
+          kubectl -n argocd rollout status statefulset/argocd-application-controller --timeout=180s
+
+      - name: Argo CD sync from Git
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        run: |
+          sed "s/REVISION/$DEPLOY_SHA/" gitops/application.yaml | kubectl apply -f -
+          for i in $(seq 1 60); do
+            status=$(kubectl -n argocd get application inventory -o jsonpath='{.status.sync.status} {.status.health.status}' 2>/dev/null)
+            echo "Argo CD: ${status:-waiting}"
+            [ "$status" = "Synced Healthy" ] && exit 0
+            sleep 5
+          done
+          kubectl -n argocd get application inventory -o yaml | tail -40
+          exit 1
+
+      - name: OpenShift rules check
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        run: |
+          pod=$(kubectl -n legacy get pod -l app=inventory -o jsonpath='{.items[0].metadata.name}')
+          echo "Namespace enforces: $(kubectl get ns legacy -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}')"
+          uid=$(kubectl -n legacy exec "$pod" -- id -u)
+          echo "Runs as UID $uid"; test "$uid" = 1000680000
+          kubectl -n legacy exec "$pod" -- sh -c 'touch /usr/local/tomcat/test 2>/dev/null' && { echo "Root filesystem is writable"; exit 1; } || echo "Root filesystem is read-only"
+          kubectl -n legacy get pods -l app=inventory
+
+      - name: RBAC check
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        run: |
+          can() { kubectl auth can-i "$@" -n legacy --as=dev@example.com --as-group=legacy-devs; }
+          check() { expected=$1; shift; got=$(can "$@" || true); printf '%-4s %-40s (expected %s)\n' "$got" "$*" "$expected"; [ "$got" = "$expected" ]; }
+          check yes get pods
+          check yes get pods --subresource=log
+          check no  delete deployment/inventory
+          check no  get secrets
+          check no  create pods
+
+      - name: Smoke test
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        run: |
+          kubectl -n legacy port-forward svc/inventory 18080:8080 >/dev/null 2>&1 &
+          sleep 3
+          body=$(curl -sf http://localhost:18080/inventory/items)
+          echo "$body"
+          test "$(echo "$body" | jq .totalUnits)" = 165
+
+      - name: Show cluster state on failure
+        if: failure() && github.ref == 'refs/heads/main'
+        run: |
+          kubectl get pods -A || true
+          kubectl -n legacy describe pods || true
+          kubectl -n legacy get events --sort-by=.lastTimestamp | tail -20 || true

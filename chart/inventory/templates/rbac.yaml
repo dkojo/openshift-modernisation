@@ -1,0 +1,27 @@
+# Least privilege for the development team, agreed with the security team:
+# they can see the app (pods, logs, events, deployments) but not change it, and never read secrets.
+# Changes only happen through Git and Argo CD.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-viewer
+rules:
+  - apiGroups: [""]
+    resources: [pods, pods/log, services, events, configmaps]
+    verbs: [get, list, watch]
+  - apiGroups: [apps]
+    resources: [deployments, replicasets]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-viewer
+subjects:
+  - kind: Group
+    name: {{ .Values.rbac.developersGroup }}
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: {{ .Release.Name }}-viewer
+  apiGroup: rbac.authorization.k8s.io

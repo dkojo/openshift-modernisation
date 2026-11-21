@@ -1,0 +1,22 @@
+image:
+  repository: ghcr.io/dkojo/openshift-modernisation/inventory
+  tag: latest   # GitOps overrides this with the commit SHA (see gitops/values-kind.yaml)
+
+replicas: 2
+
+# OpenShift assigns every pod a random UID from the namespace's range. Leave this empty on OpenShift.
+# On plain Kubernetes, set it to a high, random-looking UID to prove the image doesn't depend on its own user.
+runAsUser: null
+
+resources:
+  requests: { cpu: 100m, memory: 256Mi }
+  limits: { cpu: 500m, memory: 512Mi }
+
+# Who may look at the app (view pods, logs and events) but not change it or read secrets.
+rbac:
+  developersGroup: legacy-devs
+
+# OpenShift exposes apps with a Route. Kubernetes clusters without Routes leave this off.
+route:
+  enabled: false
+  host: ""
